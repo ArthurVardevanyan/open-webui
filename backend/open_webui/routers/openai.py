@@ -179,6 +179,11 @@ async def get_headers_and_cookies(
         if metadata and metadata.get('chat_id'):
             headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get('chat_id')
 
+    # Forward X-Session-ID from incoming request headers if present.
+    x_session_id = request.headers.get('x-session-id')
+    if x_session_id and 'X-Session-ID' not in headers:
+        headers['X-Session-ID'] = x_session_id
+
     token = None
     auth_type = config.get('auth_type')
 
