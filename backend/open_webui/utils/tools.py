@@ -181,6 +181,12 @@ async def build_tool_server_headers(
         if metadata.get('message_id'):
             headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = metadata['message_id']
 
+    # Forward X-Forwarded-For from incoming request headers if present.
+    if request:
+        x_forwarded_for = request.headers.get('x-forwarded-for')
+        if x_forwarded_for and 'X-Forwarded-For' not in headers:
+            headers['X-Forwarded-For'] = x_forwarded_for
+
     return headers, cookies
 
 

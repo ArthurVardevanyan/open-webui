@@ -221,6 +221,11 @@ async def get_headers_and_cookies(
         custom_headers = await get_custom_headers(config.get('headers'), user, metadata, request=request)
         headers.update(custom_headers)
 
+    # Forward X-Forwarded-For from incoming request headers if present.
+    x_forwarded_for = request.headers.get('x-forwarded-for')
+    if x_forwarded_for and 'X-Forwarded-For' not in headers:
+        headers['X-Forwarded-For'] = x_forwarded_for
+
     return headers, cookies
 
 

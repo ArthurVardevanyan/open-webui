@@ -127,6 +127,12 @@ async def send_request(
         if api_config and api_config.get('headers'):
             headers.update(await get_custom_headers(api_config['headers'], user, metadata, request=request))
 
+        # Forward X-Forwarded-For from incoming request headers if present.
+        if request:
+            x_forwarded_for = request.headers.get('x-forwarded-for')
+            if x_forwarded_for and 'X-Forwarded-For' not in headers:
+                headers['X-Forwarded-For'] = x_forwarded_for
+
         r = await session.request(
             method,
             url,
