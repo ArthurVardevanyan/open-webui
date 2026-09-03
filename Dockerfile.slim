@@ -1,0 +1,6 @@
+# Patched: Forward X-Forwarded-For header to upstream LLM services
+# Ref: https://github.com/open-webui/open-webui/discussions/28960 / https://github.com/open-webui/open-webui/issues/28959
+FROM ghcr.io/open-webui/open-webui:v0.11.3@sha256:751b617714b91e4cfd0186a509c72480c858e012976103b09a30dad053c36175
+COPY backend/open_webui/routers/openai.py /app/backend/open_webui/routers/openai.py
+COPY backend/open_webui/routers/ollama.py /app/backend/open_webui/routers/ollama.py
+COPY backend/open_webui/utils/tools.py /app/backend/open_webui/utils/tools.py

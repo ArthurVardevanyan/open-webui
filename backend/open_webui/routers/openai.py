@@ -82,6 +82,22 @@ def _clean_proxy_headers(raw_headers) -> dict:
     return {k: v for k, v in raw_headers.items() if k.lower() not in _STRIP_PROXY_HEADERS}
 
 
+def _is_retryable_error(status: int, body) -> bool:
+    """Return True if the response should be retried."""
+    if status == 429:
+        return True
+    if status == 500 and isinstance(body, dict):
+        detail = body.get('error', body.get('detail', '') or '')
+        if isinstance(detail, str) and 'No deployments left after routing-plugin filtering' in detail:
+            return True
+    return False
+
+
+def _get_retry_delay(base_delay: float, attempt: int) -> float:
+    """Exponential backoff with initial delay and max cap."""
+    return min(base_delay * (2 ** (attempt - 1)), 5.0)
+
+
 async def send_get_request(
     request: Request = None,
     url=None,
@@ -148,6 +164,103 @@ def openai_reasoning_model_handler(payload):
     return payload
 
 
+async def get_headers_and_cookies(
+    request: Request,
+    url,
+    key=None,
+    config=None,
+    metadata: dict | None = None,
+    user: UserModel = None,
+):
+    cookies = {}
+    headers = {
+        'Content-Type': 'application/json',
+        **(
+            {
+                # LICENSE covers this Open WebUI upstream metadata identifier.
+                # Do not alter, remove, obscure, or replace it except as LICENSE permits:
+                # https://docs.openwebui.com/license.
+                'HTTP-Referer': 'https://openwebui.com/',
+                'X-Title': 'Open WebUI',
+            }
+            if 'openrouter.ai' in url
+            else {}
+        ),
+    }
+
+    if ENABLE_FORWARD_USER_INFO_HEADERS and user:
+        headers = include_user_info_headers(headers, user)
+        if metadata and metadata.get('chat_id'):
+            headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get('chat_id')
+
+    # Forward X-Session-ID from incoming request headers if present.
+    x_session_id = request.headers.get('x-session-id')
+    if x_session_id and 'X-Session-ID' not in headers:
+        headers['X-Session-ID'] = x_session_id
+
+    token = None
+    auth_type = config.get('auth_type')
+
+    if auth_type == 'bearer' or auth_type is None:
+        # Default to bearer if not specified
+        token = f'{key}'
+    elif auth_type == 'none':
+        token = None
+    elif auth_type == 'session':
+        cookies = request.cookies
+        token = request.state.token.credentials
+    elif auth_type == 'system_oauth':
+        cookies = request.cookies
+
+        oauth_token = None
+        try:
+            if request.cookies.get('oauth_session_id', None):
+                oauth_token = await request.app.state.oauth_manager.get_oauth_token(
+                    user.id,
+                    request.cookies.get('oauth_session_id', None),
+                )
+        except Exception as e:
+            log.error(f'Error getting OAuth token: {e}')
+
+        if oauth_token:
+            token = f'{oauth_token.get("access_token", "")}'
+
+    elif auth_type in ('azure_ad', 'microsoft_entra_id'):
+        token = get_microsoft_entra_id_access_token()
+
+    if token:
+        headers['Authorization'] = f'Bearer {token}'
+
+    if config.get('headers') and isinstance(config.get('headers'), dict):
+        custom_headers = await get_custom_headers(config.get('headers'), user, metadata, request=request)
+        headers.update(custom_headers)
+
+    # Forward X-Forwarded-For from incoming request headers if present.
+    # Ref: https://github.com/open-webui/open-webui/discussions/28960 / https://github.com/open-webui/open-webui/issues/28959
+    x_forwarded_for = request.headers.get('x-forwarded-for')
+    if x_forwarded_for and 'X-Forwarded-For' not in headers:
+        headers['X-Forwarded-For'] = x_forwarded_for
+
+    return headers, cookies
+
+
+def get_microsoft_entra_id_access_token():
+    """
+    Get Microsoft Entra ID access token using DefaultAzureCredential for Azure OpenAI.
+    Returns the token string or None if authentication fails.
+    """
+    try:
+        token_provider = get_bearer_token_provider(
+            DefaultAzureCredential(), 'https://cognitiveservices.azure.com/.default'
+        )
+        return token_provider()
+    except Exception as e:
+        log.error(f'Error getting Microsoft Entra ID access token: {e}')
+        return None
+
+
+##########################################
+#
 # API routes
 
 router = APIRouter()
@@ -321,45 +434,50 @@ async def send_model_management_request(
 
     response = None
     streaming = False
-    try:
-        session = await get_session()
-        response = await session.request(
-            method,
-            f'{root_url}{path}',
-            json=payload,
-            params=query,
-            headers=headers,
-            cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=get_client_timeout(stream=stream),
-        )
-
-        if not response.ok:
-            try:
-                error = await response.json(loads=JSONCodec.loads)
-            except Exception:
-                error = await response.text()
-            raise HTTPException(status_code=response.status, detail=error)
-
-        if stream:
-            streaming = True
-            return StreamingResponse(
-                stream_wrapper(response, passthrough=True),
-                status_code=response.status,
-                headers=_clean_proxy_headers(response.headers),
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            session = await get_session()
+            response = await session.request(
+                method,
+                f'{root_url}{path}',
+                json=payload,
+                params=query,
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                timeout=get_client_timeout(stream=stream),
             )
 
-        try:
-            return await response.json(loads=JSONCodec.loads)
-        except Exception:
-            return {'success': True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=response.status if response else 500, detail=str(e))
-    finally:
-        if not streaming:
-            await cleanup_response(response)
+            if not response.ok:
+                try:
+                    error = await response.json(loads=JSONCodec.loads)
+                except Exception:
+                    error = await response.text()
+                if _is_retryable_error(response.status, error) and attempt < max_retries - 1:
+                    await asyncio.sleep(_get_retry_delay(1.0, attempt))
+                    continue
+                raise HTTPException(status_code=response.status, detail=error)
+
+            if stream:
+                streaming = True
+                return StreamingResponse(
+                    stream_wrapper(response, passthrough=True),
+                    status_code=response.status,
+                    headers=_clean_proxy_headers(response.headers),
+                )
+
+            try:
+                return await response.json(loads=JSONCodec.loads)
+            except Exception:
+                return {'success': True}
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=response.status if response else 500, detail=str(e))
+        finally:
+            if not streaming:
+                await cleanup_response(response)
 
 
 async def get_anthropic_request_target(request: Request, form_data: dict, user: UserModel):
@@ -407,49 +525,54 @@ async def count_anthropic_tokens(request: Request, form_data: dict, user: UserMo
     requested_model, payload, url, key, headers, cookies = await get_anthropic_request_target(request, form_data, user)
     request_url = f'{url.rstrip("/")}/messages/count_tokens'
     response = None
+    max_retries = 3
 
-    try:
-        session = await get_session()
-        response = await session.request(
-            method='POST',
-            url=request_url,
-            data=JSONCodec.dumps(payload),
-            headers=headers,
-            cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=get_client_timeout(),
-        )
-
+    for attempt in range(max_retries):
         try:
-            response_data = await response.json(loads=JSONCodec.loads)
-        except Exception:
-            response_data = await response.text()
-
-        if response.status >= 400:
-            await publish_model_provider_request_failed(
-                request,
-                actor=user,
-                provider='openai-compatible',
-                base_url=url,
-                api_key=key,
-                status=response.status,
-                requested_model=requested_model,
-                upstream_error=response_data,
+            session = await get_session()
+            response = await session.request(
+                method='POST',
+                url=request_url,
+                data=JSONCodec.dumps(payload),
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                timeout=get_client_timeout(),
             )
-            raise HTTPException(status_code=response.status, detail=response_data)
 
-        input_tokens = response_data.get('input_tokens') if isinstance(response_data, dict) else None
-        if isinstance(input_tokens, bool) or not isinstance(input_tokens, int) or input_tokens < 0:
-            raise HTTPException(status_code=502, detail='Invalid token-count response from upstream provider')
+            try:
+                response_data = await response.json(loads=JSONCodec.loads)
+            except Exception:
+                response_data = await response.text()
 
-        return input_tokens
-    except HTTPException:
-        raise
-    except Exception:
-        log.exception('Failed to count Anthropic tokens for model %s', requested_model)
-        raise HTTPException(status_code=502, detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR)
-    finally:
-        await cleanup_response(response)
+            if response.status >= 400:
+                if _is_retryable_error(response.status, response_data) and attempt < max_retries - 1:
+                    await asyncio.sleep(_get_retry_delay(1.0, attempt))
+                    continue
+                await publish_model_provider_request_failed(
+                    request,
+                    actor=user,
+                    provider='openai-compatible',
+                    base_url=url,
+                    api_key=key,
+                    status=response.status,
+                    requested_model=requested_model,
+                    upstream_error=response_data,
+                )
+                raise HTTPException(status_code=response.status, detail=response_data)
+
+            input_tokens = response_data.get('input_tokens') if isinstance(response_data, dict) else None
+            if isinstance(input_tokens, bool) or not isinstance(input_tokens, int) or input_tokens < 0:
+                raise HTTPException(status_code=502, detail='Invalid token-count response from upstream provider')
+
+            return input_tokens
+        except HTTPException:
+            raise
+        except Exception:
+            log.exception('Failed to count Anthropic tokens for model %s', requested_model)
+            raise HTTPException(status_code=502, detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR)
+        finally:
+            await cleanup_response(response)
 
 
 @router.get('/config')
@@ -1578,108 +1701,110 @@ async def generate_chat_completion(
     r = None
     streaming = False
     response = None
+    max_retries = 3
 
-    try:
-        session = await get_session()
+    for attempt in range(max_retries):
+        try:
+            session = await get_session()
 
-        r = await session.request(
-            method='POST',
-            url=request_url,
-            data=payload,
-            headers=headers,
-            cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=get_client_timeout(stream=is_streaming_request),
-        )
-
-        # Check if response is SSE
-        if 'text/event-stream' in r.headers.get('Content-Type', ''):
-            # If the provider returned an error status with SSE content-type,
-            # read the body and return a proper error response instead of
-            # streaming the error back (which hides the error from logs).
-            if r.status >= 400:
-                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
-                error_body = await r.text()
-                log.error(
-                    'Provider returned HTTP %d with SSE content-type: %s',
-                    r.status,
-                    error_body[:1000],
-                )
-                try:
-                    error_json = JSONCodec.loads(error_body)
-                    await publish_model_provider_request_failed(
-                        request,
-                        actor=user,
-                        provider='openai-compatible',
-                        base_url=url,
-                        api_key=key,
-                        status=r.status,
-                        requested_model=requested_model,
-                        upstream_error=error_json,
-                    )
-                    return JSONResponse(status_code=r.status, content=error_json, headers=retry_headers)
-                except JSONCodec.JSONDecodeError:
-                    await publish_model_provider_request_failed(
-                        request,
-                        actor=user,
-                        provider='openai-compatible',
-                        base_url=url,
-                        api_key=key,
-                        status=r.status,
-                        requested_model=requested_model,
-                        upstream_error=error_body,
-                    )
-                    return JSONResponse(
-                        status_code=r.status,
-                        content={'error': {'message': error_body, 'code': r.status}},
-                        headers=retry_headers,
-                    )
-
-            streaming = True
-            return StreamingResponse(
-                stream_wrapper(r),
-                status_code=r.status,
-                headers=_clean_proxy_headers(r.headers),
+            r = await session.request(
+                method='POST',
+                url=request_url,
+                data=payload,
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                timeout=get_client_timeout(stream=is_streaming_request),
             )
-        else:
-            try:
-                response = await r.json(loads=JSONCodec.loads)
-            except Exception as e:
-                log.error(e)
-                response = await r.text()
 
-            if r.status >= 400:
-                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
-                await publish_model_provider_request_failed(
-                    request,
-                    actor=user,
-                    provider='openai-compatible',
-                    base_url=url,
-                    api_key=key,
-                    status=r.status,
-                    requested_model=requested_model,
-                    upstream_error=response,
+            # Check if response is SSE
+            if 'text/event-stream' in r.headers.get('Content-Type', ''):
+                # If the provider returned an error status with SSE content-type,
+                # read the body and return a proper error response instead of
+                # streaming the error back (which hides the error from logs).
+                if r.status >= 400:
+                    error_body = await r.text()
+                    log.error(
+                        'Provider returned HTTP %d with SSE content-type: %s',
+                        r.status,
+                        error_body[:1000],
+                    )
+                    try:
+                        error_json = JSONCodec.loads(error_body)
+                        await publish_model_provider_request_failed(
+                            request,
+                            actor=user,
+                            provider='openai-compatible',
+                            base_url=url,
+                            api_key=key,
+                            status=r.status,
+                            requested_model=requested_model,
+                            upstream_error=error_json,
+                        )
+                        return JSONResponse(status_code=r.status, content=error_json)
+                    except JSONCodec.JSONDecodeError:
+                        await publish_model_provider_request_failed(
+                            request,
+                            actor=user,
+                            provider='openai-compatible',
+                            base_url=url,
+                            api_key=key,
+                            status=r.status,
+                            requested_model=requested_model,
+                            upstream_error=error_body,
+                        )
+                        return JSONResponse(
+                            status_code=r.status,
+                            content={'error': {'message': error_body, 'code': r.status}},
+                        )
+
+                streaming = True
+                return StreamingResponse(
+                    stream_wrapper(r),
+                    status_code=r.status,
+                    headers=_clean_proxy_headers(r.headers),
                 )
-                if isinstance(response, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response, headers=retry_headers)
-                else:
-                    return PlainTextResponse(status_code=r.status, content=response, headers=retry_headers)
+            else:
+                try:
+                    response = await r.json(loads=JSONCodec.loads)
+                except Exception as e:
+                    log.error(e)
+                    response = await r.text()
 
-            # Convert Responses API result to simple format
-            if is_responses and isinstance(response, dict):
-                response = convert_responses_result(response)
+                if r.status >= 400:
+                    if _is_retryable_error(r.status, response) and attempt < max_retries - 1:
+                        await asyncio.sleep(_get_retry_delay(1.0, attempt))
+                        continue
+                    await publish_model_provider_request_failed(
+                        request,
+                        actor=user,
+                        provider='openai-compatible',
+                        base_url=url,
+                        api_key=key,
+                        status=r.status,
+                        requested_model=requested_model,
+                        upstream_error=response,
+                    )
+                    if isinstance(response, (dict, list)):
+                        return JSONResponse(status_code=r.status, content=response)
+                    else:
+                        return PlainTextResponse(status_code=r.status, content=response)
 
-            return response
-    except Exception as e:
-        log.exception(e)
+                # Convert Responses API result to simple format
+                if is_responses and isinstance(response, dict):
+                    response = convert_responses_result(response)
 
-        raise HTTPException(
-            status_code=r.status if r else 500,
-            detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR,
-        )
-    finally:
-        if not streaming:
-            await cleanup_response(r)
+                return response
+        except Exception as e:
+            log.exception(e)
+
+            raise HTTPException(
+                status_code=r.status if r else 500,
+                detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR,
+            )
+        finally:
+            if not streaming:
+                await cleanup_response(r)
 
 
 async def embeddings(request: Request, form_data: dict, user):
@@ -1736,59 +1861,63 @@ async def embeddings(request: Request, form_data: dict, user):
     else:
         embeddings_url = f'{url}/embeddings'
     requested_model = form_data.get('model')
+    max_retries = 3
 
-    try:
-        session = await get_session()
-        r = await session.request(
-            method='POST',
-            url=embeddings_url,
-            data=body,
-            headers=headers,
-            cookies=cookies,
-            timeout=get_client_timeout(),
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-        )
-
-        if 'text/event-stream' in r.headers.get('Content-Type', ''):
-            streaming = True
-            return StreamingResponse(
-                stream_wrapper(r, passthrough=True),
-                status_code=r.status,
-                headers=_clean_proxy_headers(r.headers),
+    for attempt in range(max_retries):
+        try:
+            session = await get_session()
+            r = await session.request(
+                method='POST',
+                url=embeddings_url,
+                data=body,
+                headers=headers,
+                cookies=cookies,
+                timeout=get_client_timeout(),
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
             )
-        else:
-            try:
-                response_data = await r.json(loads=JSONCodec.loads)
-            except Exception:
-                response_data = await r.text()
 
-            if r.status >= 400:
-                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
-                await publish_model_provider_request_failed(
-                    request,
-                    actor=user,
-                    provider='openai-compatible',
-                    base_url=url,
-                    api_key=key,
-                    status=r.status,
-                    requested_model=requested_model,
-                    upstream_error=response_data,
+            if 'text/event-stream' in r.headers.get('Content-Type', ''):
+                streaming = True
+                return StreamingResponse(
+                    stream_wrapper(r, passthrough=True),
+                    status_code=r.status,
+                    headers=_clean_proxy_headers(r.headers),
                 )
-                if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
-                else:
-                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
+            else:
+                try:
+                    response_data = await r.json(loads=JSONCodec.loads)
+                except Exception:
+                    response_data = await r.text()
 
-            return response_data
-    except Exception as e:
-        log.exception(e)
-        raise HTTPException(
-            status_code=r.status if r else 500,
-            detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR,
-        )
-    finally:
-        if not streaming:
-            await cleanup_response(r)
+                if r.status >= 400:
+                    if _is_retryable_error(r.status, response_data) and attempt < max_retries - 1:
+                        await asyncio.sleep(_get_retry_delay(1.0, attempt))
+                        continue
+                    await publish_model_provider_request_failed(
+                        request,
+                        actor=user,
+                        provider='openai-compatible',
+                        base_url=url,
+                        api_key=key,
+                        status=r.status,
+                        requested_model=requested_model,
+                        upstream_error=response_data,
+                    )
+                    if isinstance(response_data, (dict, list)):
+                        return JSONResponse(status_code=r.status, content=response_data)
+                    else:
+                        return PlainTextResponse(status_code=r.status, content=response_data)
+
+                return response_data
+        except Exception as e:
+            log.exception(e)
+            raise HTTPException(
+                status_code=r.status if r else 500,
+                detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR,
+            )
+        finally:
+            if not streaming:
+                await cleanup_response(r)
 
 
 class ResponsesForm(BaseModel):
@@ -1846,82 +1975,86 @@ async def responses(
 
     r = None
     streaming = False
+    max_retries = 3
 
-    try:
-        headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
+    for attempt in range(max_retries):
+        try:
+            headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
 
-        if api_config.get('azure') or api_config.get('provider') == 'azure':
-            auth_type = api_config.get('auth_type', 'bearer')
-            if auth_type not in ('azure_ad', 'microsoft_entra_id'):
-                headers['api-key'] = key
+            if api_config.get('azure') or api_config.get('provider') == 'azure':
+                auth_type = api_config.get('auth_type', 'bearer')
+                if auth_type not in ('azure_ad', 'microsoft_entra_id'):
+                    headers['api-key'] = key
 
-            is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
+                is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
 
-            if is_azure_v1:
-                request_url = f'{url.rstrip("/")}/responses'
-            else:
-                api_version = api_config.get('api_version', '2023-03-15-preview')
-                headers['api-version'] = api_version
-                model = _sanitize_model_for_url(payload.get('model', ''))
-                request_url = f'{url}/openai/deployments/{model}/responses?api-version={api_version}'
-        else:
-            request_url = f'{url}/responses'
-
-        session = await get_session()
-        r = await session.request(
-            method='POST',
-            url=request_url,
-            data=body,
-            headers=headers,
-            cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=get_client_timeout(stream=is_streaming_request),
-        )
-
-        # Check if response is SSE
-        if 'text/event-stream' in r.headers.get('Content-Type', ''):
-            streaming = True
-            return StreamingResponse(
-                stream_wrapper(r, passthrough=True),
-                status_code=r.status,
-                headers=_clean_proxy_headers(r.headers),
-            )
-        else:
-            try:
-                response_data = await r.json(loads=JSONCodec.loads)
-            except Exception:
-                response_data = await r.text()
-
-            if r.status >= 400:
-                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
-                await publish_model_provider_request_failed(
-                    request,
-                    actor=user,
-                    provider='openai-compatible',
-                    base_url=url,
-                    api_key=key,
-                    status=r.status,
-                    requested_model=payload.get('model'),
-                    upstream_error=response_data,
-                )
-                if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
+                if is_azure_v1:
+                    request_url = f'{url.rstrip("/")}/responses'
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
+                    api_version = api_config.get('api_version', '2023-03-15-preview')
+                    headers['api-version'] = api_version
+                    model = _sanitize_model_for_url(payload.get('model', ''))
+                    request_url = f'{url}/openai/deployments/{model}/responses?api-version={api_version}'
+            else:
+                request_url = f'{url}/responses'
 
-            return response_data
+            session = await get_session()
+            r = await session.request(
+                method='POST',
+                url=request_url,
+                data=body,
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                timeout=get_client_timeout(stream=is_streaming_request),
+            )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception(e)
-        raise HTTPException(
-            status_code=r.status if r else 500,
-            detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR,
-        )
-    finally:
-        if not streaming:
-            await cleanup_response(r)
+            # Check if response is SSE
+            if 'text/event-stream' in r.headers.get('Content-Type', ''):
+                streaming = True
+                return StreamingResponse(
+                    stream_wrapper(r, passthrough=True),
+                    status_code=r.status,
+                    headers=_clean_proxy_headers(r.headers),
+                )
+            else:
+                try:
+                    response_data = await r.json(loads=JSONCodec.loads)
+                except Exception:
+                    response_data = await r.text()
+
+                if r.status >= 400:
+                    if _is_retryable_error(r.status, response_data) and attempt < max_retries - 1:
+                        await asyncio.sleep(_get_retry_delay(1.0, attempt))
+                        continue
+                    await publish_model_provider_request_failed(
+                        request,
+                        actor=user,
+                        provider='openai-compatible',
+                        base_url=url,
+                        api_key=key,
+                        status=r.status,
+                        requested_model=payload.get('model'),
+                        upstream_error=response_data,
+                    )
+                    if isinstance(response_data, (dict, list)):
+                        return JSONResponse(status_code=r.status, content=response_data)
+                    else:
+                        return PlainTextResponse(status_code=r.status, content=response_data)
+
+                return response_data
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.exception(e)
+            raise HTTPException(
+                status_code=r.status if r else 500,
+                detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR,
+            )
+        finally:
+            if not streaming:
+                await cleanup_response(r)
 
 
 @router.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE'])
@@ -1964,88 +2097,92 @@ async def proxy(path: str, request: Request, user=Depends(get_verified_user)):
 
     r = None
     streaming = False
+    max_retries = 3
 
-    try:
-        headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
+    for attempt in range(max_retries):
+        try:
+            headers, cookies = await get_headers_and_cookies(request, url, key, api_config, user=user)
 
-        if api_config.get('azure') or api_config.get('provider') == 'azure':
-            # Only set api-key header if not using Azure Entra ID authentication
-            auth_type = api_config.get('auth_type', 'bearer')
-            if auth_type not in ('azure_ad', 'microsoft_entra_id'):
-                headers['api-key'] = key
+            if api_config.get('azure') or api_config.get('provider') == 'azure':
+                # Only set api-key header if not using Azure Entra ID authentication
+                auth_type = api_config.get('auth_type', 'bearer')
+                if auth_type not in ('azure_ad', 'microsoft_entra_id'):
+                    headers['api-key'] = key
 
-            is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
+                is_azure_v1 = bool(re.search(r'/openai/v1(?:/|$)', url))
 
-            if is_azure_v1:
-                qs = request.url.query
-                request_url = f'{url.rstrip("/")}/{path}' + (f'?{qs}' if qs else '')
-            else:
-                api_version = api_config.get('api_version', '2023-03-15-preview')
-                headers['api-version'] = api_version
-
-                payload = JSONCodec.loads(body)
-                url, payload = convert_to_azure_payload(url, payload, api_version)
-                body = JSONCodec.dumps(payload).encode()
-
-                request_url = f'{url}/{path}?api-version={api_version}'
-        else:
-            request_url = f'{url}/{path}'
-
-        session = await get_session()
-        r = await session.request(
-            method=request.method,
-            url=request_url,
-            data=body,
-            headers=headers,
-            cookies=cookies,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=get_client_timeout(stream=is_streaming_request),
-        )
-
-        # Check if response is SSE
-        if 'text/event-stream' in r.headers.get('Content-Type', ''):
-            streaming = True
-            return StreamingResponse(
-                stream_wrapper(r, passthrough=True),
-                status_code=r.status,
-                headers=_clean_proxy_headers(r.headers),
-            )
-        else:
-            try:
-                response_data = await r.json(loads=JSONCodec.loads)
-            except Exception:
-                response_data = await r.text()
-
-            if r.status >= 400:
-                retry_headers = {k: v for k, v in r.headers.items() if k.lower() in ('retry-after', 'retry-after-ms')}
-                await publish_model_provider_request_failed(
-                    request,
-                    actor=user,
-                    provider='openai-compatible',
-                    base_url=base_url,
-                    api_key=key,
-                    status=r.status,
-                    requested_model=model_id,
-                    upstream_error=response_data,
-                )
-                if isinstance(response_data, (dict, list)):
-                    return JSONResponse(status_code=r.status, content=response_data, headers=retry_headers)
+                if is_azure_v1:
+                    qs = request.url.query
+                    request_url = f'{url.rstrip("/")}/{path}' + (f'?{qs}' if qs else '')
                 else:
-                    return PlainTextResponse(status_code=r.status, content=response_data, headers=retry_headers)
+                    api_version = api_config.get('api_version', '2023-03-15-preview')
+                    headers['api-version'] = api_version
 
-            return response_data
+                    payload = JSONCodec.loads(body)
+                    url, payload = convert_to_azure_payload(url, payload, api_version)
+                    body = JSONCodec.dumps(payload).encode()
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        log.exception(e)
-        # LICENSE covers this Open WebUI error identifier.
-        # Do not alter, remove, obscure, or replace it except as LICENSE permits:
-        # https://docs.openwebui.com/license.
-        raise HTTPException(
-            status_code=r.status if r else 500,
-            detail='Open WebUI: Server Connection Error',
-        )
-    finally:
-        if not streaming:
-            await cleanup_response(r)
+                    request_url = f'{url}/{path}?api-version={api_version}'
+            else:
+                request_url = f'{url}/{path}'
+
+            session = await get_session()
+            r = await session.request(
+                method=request.method,
+                url=request_url,
+                data=body,
+                headers=headers,
+                cookies=cookies,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                timeout=get_client_timeout(stream=is_streaming_request),
+            )
+
+            # Check if response is SSE
+            if 'text/event-stream' in r.headers.get('Content-Type', ''):
+                streaming = True
+                return StreamingResponse(
+                    stream_wrapper(r, passthrough=True),
+                    status_code=r.status,
+                    headers=_clean_proxy_headers(r.headers),
+                )
+            else:
+                try:
+                    response_data = await r.json(loads=JSONCodec.loads)
+                except Exception:
+                    response_data = await r.text()
+
+                if r.status >= 400:
+                    if _is_retryable_error(r.status, response_data) and attempt < max_retries - 1:
+                        await asyncio.sleep(_get_retry_delay(1.0, attempt))
+                        continue
+                    await publish_model_provider_request_failed(
+                        request,
+                        actor=user,
+                        provider='openai-compatible',
+                        base_url=base_url,
+                        api_key=key,
+                        status=r.status,
+                        requested_model=model_id,
+                        upstream_error=response_data,
+                    )
+                    if isinstance(response_data, (dict, list)):
+                        return JSONResponse(status_code=r.status, content=response_data)
+                    else:
+                        return PlainTextResponse(status_code=r.status, content=response_data)
+
+                return response_data
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            log.exception(e)
+            # LICENSE covers this Open WebUI error identifier.
+            # Do not alter, remove, obscure, or replace it except as LICENSE permits:
+            # https://docs.openwebui.com/license.
+            raise HTTPException(
+                status_code=r.status if r else 500,
+                detail='Open WebUI: Server Connection Error',
+            )
+        finally:
+            if not streaming:
+                await cleanup_response(r)
