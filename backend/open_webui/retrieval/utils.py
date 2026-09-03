@@ -896,12 +896,22 @@ def generate_openai_batch_embeddings(
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
 
-    r = requests.post(
-        f'{url}/embeddings',
-        headers=headers,
-        json=json_data,
-    )
-    r.raise_for_status()
+    for attempt in range(5):
+        r = requests.post(
+            f'{url}/embeddings',
+            headers=headers,
+            json=json_data,
+        )
+        if r.status_code == 429:
+            retry = float(r.headers.get('Retry-After', '1'))
+            log.warning('OpenAI embeddings rate limited (attempt %d/%d), retrying after %.1fs', attempt + 1, 5, retry)
+            time.sleep(retry)
+            continue
+        r.raise_for_status()
+        break
+    else:
+        raise Exception('OpenAI embedding request failed: max retries (429) exceeded')
+
     data = r.json()
     if 'data' in data:
         return [elem['embedding'] for elem in data['data']]
@@ -926,21 +936,31 @@ async def agenerate_openai_batch_embeddings(
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
 
-    async with aiohttp.ClientSession(
-        trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-    ) as session:
-        async with session.post(
-            f'{url}/embeddings',
-            headers=headers,
-            json=form_data,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-        ) as r:
-            r.raise_for_status()
-            data = await r.json()
-            if 'data' in data:
-                return [item['embedding'] for item in data['data']]
-            else:
-                raise ValueError("Unexpected OpenAI embeddings response: missing 'data' key")
+    for attempt in range(5):
+        async with aiohttp.ClientSession(
+            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+        ) as session:
+            async with session.post(
+                f'{url}/embeddings',
+                headers=headers,
+                json=form_data,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as r:
+                if r.status == 429:
+                    retry = float(r.headers.get('Retry-After', '1'))
+                    log.warning('OpenAI embeddings rate limited (attempt %d/%d), retrying after %.1fs', attempt + 1, 5, retry)
+                    await asyncio.sleep(retry)
+                    break
+                r.raise_for_status()
+                data = await r.json()
+                break
+    else:
+        raise Exception('OpenAI embedding request failed: max retries (429) exceeded')
+
+    if 'data' in data:
+        return [item['embedding'] for item in data['data']]
+    else:
+        raise ValueError("Unexpected OpenAI embeddings response: missing 'data' key")
 
 
 def generate_azure_openai_batch_embeddings(
@@ -1042,15 +1062,24 @@ def generate_ollama_batch_embeddings(
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
 
-    r = requests.post(
-        f'{url}/api/embed',
-        headers=headers,
-        json=json_data,
-    )
-    if r.status_code != 200:
-        error_detail = r.json().get('error', r.text)
-        raise Exception(f'Ollama embed error ({r.status_code}): {error_detail}')
-    data = r.json()
+    for attempt in range(5):
+        r = requests.post(
+            f'{url}/api/embed',
+            headers=headers,
+            json=json_data,
+        )
+        if r.status_code == 429:
+            retry = float(r.headers.get('Retry-After', '1'))
+            log.warning('Ollama embeddings rate limited (attempt %d/%d), retrying after %.1fs', attempt + 1, 5, retry)
+            time.sleep(retry)
+            continue
+        if r.status_code != 200:
+            error_detail = r.json().get('error', r.text)
+            raise Exception(f'Ollama embed error ({r.status_code}): {error_detail}')
+        data = r.json()
+        break
+    else:
+        raise Exception('Ollama embedding request failed: max retries (429) exceeded')
 
     if 'embeddings' in data:
         return data['embeddings']
@@ -1075,24 +1104,34 @@ async def agenerate_ollama_batch_embeddings(
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
         headers = include_user_info_headers(headers, user)
 
-    async with aiohttp.ClientSession(
-        trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
-    ) as session:
-        async with session.post(
-            f'{url}/api/embed',
-            headers=headers,
-            json=form_data,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-        ) as r:
-            if r.status != 200:
-                error_data = await r.json()
-                error_detail = error_data.get('error', str(error_data))
-                raise Exception(f'Ollama embed error ({r.status}): {error_detail}')
-            data = await r.json()
-            if 'embeddings' in data:
-                return data['embeddings']
-            else:
-                raise ValueError("Unexpected Ollama embeddings response: missing 'embeddings' key")
+    for attempt in range(5):
+        async with aiohttp.ClientSession(
+            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+        ) as session:
+            async with session.post(
+                f'{url}/api/embed',
+                headers=headers,
+                json=form_data,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+            ) as r:
+                if r.status == 429:
+                    retry = float(r.headers.get('Retry-After', '1'))
+                    log.warning('Ollama embeddings rate limited (attempt %d/%d), retrying after %.1fs', attempt + 1, 5, retry)
+                    await asyncio.sleep(retry)
+                    break
+                if r.status != 200:
+                    error_data = await r.json()
+                    error_detail = error_data.get('error', str(error_data))
+                    raise Exception(f'Ollama embed error ({r.status}): {error_detail}')
+                data = await r.json()
+                break
+    else:
+        raise Exception('Ollama embedding request failed: max retries (429) exceeded')
+
+    if 'embeddings' in data:
+        return data['embeddings']
+    else:
+        raise ValueError("Unexpected Ollama embeddings response: missing 'embeddings' key")
 
 
 def get_embedding_function(

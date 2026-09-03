@@ -124,6 +124,22 @@ from pydantic.fields import FieldInfo
 log = logging.getLogger(__name__)
 
 
+def _is_retryable_error(status: int, body) -> bool:
+    """Return True if the response should be retried."""
+    if status == 429:
+        return True
+    if status == 500 and isinstance(body, dict):
+        detail = body.get('error', body.get('detail', '') or '')
+        if isinstance(detail, str) and 'No deployments left after routing-plugin filtering' in detail:
+            return True
+    return False
+
+
+def _get_retry_delay(base_delay: float, attempt: int) -> float:
+    """Exponential backoff with initial delay and max cap."""
+    return min(base_delay * (2 ** (attempt - 1)), 5.0)
+
+
 async def build_tool_server_headers(
     connection: dict,
     request,
@@ -182,6 +198,13 @@ async def build_tool_server_headers(
             headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata['chat_id']
         if metadata.get('message_id'):
             headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = metadata['message_id']
+
+    # Forward X-Forwarded-For from incoming request headers if present.
+    # Ref: https://github.com/open-webui/open-webui/discussions/28960 / https://github.com/open-webui/open-webui/issues/28959
+    if request:
+        x_forwarded_for = request.headers.get('x-forwarded-for')
+        if x_forwarded_for and 'X-Forwarded-For' not in headers:
+            headers['X-Forwarded-For'] = x_forwarded_for
 
     return headers, cookies
 
@@ -1715,58 +1738,67 @@ async def execute_tool_server(
             trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_TOOL_SERVER)
         ) as session:
             request_method = getattr(session, http_method.lower())
+            max_retries = 3
 
             if http_method in ['post', 'put', 'patch', 'delete']:
-                async with request_method(
-                    final_url,
-                    json=body_params,
-                    headers=headers,
-                    cookies=cookies,
-                    ssl=AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL,
-                    allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS,
-                ) as response:
-                    if response.status >= 400:
-                        text = await response.text()
-                        raise Exception(f'HTTP error {response.status}: {text}')
+                for attempt in range(max_retries):
+                    async with request_method(
+                        final_url,
+                        json=body_params,
+                        headers=headers,
+                        cookies=cookies,
+                        ssl=AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL,
+                        allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS,
+                    ) as response:
+                        if response.status >= 400:
+                            text = await response.text()
+                            if _is_retryable_error(response.status, text) and attempt < max_retries - 1:
+                                await asyncio.sleep(_get_retry_delay(1.0, attempt))
+                                continue
+                            raise Exception(f'HTTP error {response.status}: {text}')
 
-                    try:
-                        response_data = await response.json()
-                    except Exception:
-                        content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
-                        if content_type.startswith('text/') or not content_type:
-                            response_data = await response.text()
-                        else:
-                            raw = await response.read()
-                            b64 = base64.b64encode(raw).decode()
-                            response_data = f'data:{content_type};base64,{b64}'
+                        try:
+                            response_data = await response.json()
+                        except Exception:
+                            content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+                            if content_type.startswith('text/') or not content_type:
+                                response_data = await response.text()
+                            else:
+                                raw = await response.read()
+                                b64 = base64.b64encode(raw).decode()
+                                response_data = f'data:{content_type};base64,{b64}'
 
-                    response_headers = response.headers
-                    return (response_data, response_headers)
+                        response_headers = response.headers
+                        return (response_data, response_headers)
             else:
-                async with request_method(
-                    final_url,
-                    headers=headers,
-                    cookies=cookies,
-                    ssl=AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL,
-                    allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS,
-                ) as response:
-                    if response.status >= 400:
-                        text = await response.text()
-                        raise Exception(f'HTTP error {response.status}: {text}')
+                for attempt in range(max_retries):
+                    async with request_method(
+                        final_url,
+                        headers=headers,
+                        cookies=cookies,
+                        ssl=AIOHTTP_CLIENT_SESSION_TOOL_SERVER_SSL,
+                        allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS,
+                    ) as response:
+                        if response.status >= 400:
+                            text = await response.text()
+                            if _is_retryable_error(response.status, text) and attempt < max_retries - 1:
+                                await asyncio.sleep(_get_retry_delay(1.0, attempt))
+                                continue
+                            raise Exception(f'HTTP error {response.status}: {text}')
 
-                    try:
-                        response_data = await response.json()
-                    except Exception:
-                        content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
-                        if content_type.startswith('text/') or not content_type:
-                            response_data = await response.text()
-                        else:
-                            raw = await response.read()
-                            b64 = base64.b64encode(raw).decode()
-                            response_data = f'data:{content_type};base64,{b64}'
+                        try:
+                            response_data = await response.json()
+                        except Exception:
+                            content_type = response.headers.get('Content-Type', '').split(';')[0].strip()
+                            if content_type.startswith('text/') or not content_type:
+                                response_data = await response.text()
+                            else:
+                                raw = await response.read()
+                                b64 = base64.b64encode(raw).decode()
+                                response_data = f'data:{content_type};base64,{b64}'
 
-                    response_headers = response.headers
-                    return (response_data, response_headers)
+                        response_headers = response.headers
+                        return (response_data, response_headers)
 
     except Exception as err:
         error = str(err)

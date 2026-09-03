@@ -60,6 +60,22 @@ _MODEL_LIST_TIMEOUT = aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT_MODEL_L
 BASE_MODELS_CACHE_KEY = f'{REDIS_KEY_PREFIX}:models:base'
 
 
+def _is_retryable_error(status: int, body) -> bool:
+    """Return True if the response should be retried."""
+    if status == 429:
+        return True
+    if status == 500 and isinstance(body, dict):
+        detail = body.get('error', body.get('detail', '') or '')
+        if isinstance(detail, str) and 'No deployments left after routing-plugin filtering' in detail:
+            return True
+    return False
+
+
+def _get_retry_delay(base_delay: float, attempt: int) -> float:
+    """Exponential backoff with initial delay and max cap."""
+    return min(base_delay * (2 ** (attempt - 1)), 5.0)
+
+
 def _clean_proxy_headers(raw_headers) -> dict:
     """Return a copy of *raw_headers* with stale encoding headers removed."""
     return {k: v for k, v in raw_headers.items() if k not in _STRIP_PROXY_HEADERS}
@@ -110,6 +126,8 @@ async def send_request(
 ):
     r = None
     streaming = False
+    max_retries = 3
+
     try:
         session = await get_session()
 
@@ -127,18 +145,31 @@ async def send_request(
         if api_config and api_config.get('headers'):
             headers.update(await get_custom_headers(api_config['headers'], user, metadata, request=request))
 
-        r = await session.request(
-            method,
-            url,
-            data=payload,
-            headers=headers,
-            ssl=AIOHTTP_CLIENT_SESSION_SSL,
-            timeout=get_client_timeout(stream=stream),
-        )
+        # Forward X-Forwarded-For from incoming request headers if present.
+        # Ref: https://github.com/open-webui/open-webui/discussions/28960 / https://github.com/open-webui/open-webui/issues/28959
+        if request:
+            x_forwarded_for = request.headers.get('x-forwarded-for')
+            if x_forwarded_for and 'X-Forwarded-For' not in headers:
+                headers['X-Forwarded-For'] = x_forwarded_for
 
-        if not r.ok:
-            try:
-                res = await r.json(loads=JSONCodec.loads)
+        for attempt in range(max_retries):
+            r = await session.request(
+                method,
+                url,
+                data=payload,
+                headers=headers,
+                ssl=AIOHTTP_CLIENT_SESSION_SSL,
+                timeout=get_client_timeout(stream=stream),
+            )
+
+            if not r.ok:
+                try:
+                    res = await r.json(loads=JSONCodec.loads)
+                except Exception:
+                    res = await r.text()
+                if _is_retryable_error(r.status, res) and attempt < max_retries - 1:
+                    await asyncio.sleep(_get_retry_delay(1.0, attempt))
+                    continue
                 await publish_model_provider_request_failed(
                     request,
                     actor=user,
@@ -149,40 +180,36 @@ async def send_request(
                 )
                 if 'error' in res:
                     raise HTTPException(status_code=r.status, detail=res['error'])
-            except HTTPException:
-                raise
-            except Exception as e:
-                log.error(f'Failed to parse error response: {e}')
-                await publish_model_provider_request_failed(
-                    request,
-                    actor=user,
-                    provider='ollama',
-                    base_url=url,
-                    status=r.status,
-                )
+            await publish_model_provider_request_failed(
+                request,
+                actor=user,
+                provider='ollama',
+                base_url=url,
+                status=r.status,
+            )
             raise HTTPException(
                 status_code=r.status,
                 detail=ERROR_MESSAGES.SERVER_CONNECTION_ERROR,
             )
 
-        r.raise_for_status()
+            r.raise_for_status()
 
-        if stream:
-            response_headers = _clean_proxy_headers(r.headers)
-            if content_type:
-                response_headers['Content-Type'] = content_type
+            if stream:
+                response_headers = _clean_proxy_headers(r.headers)
+                if content_type:
+                    response_headers['Content-Type'] = content_type
 
-            streaming = True
-            return StreamingResponse(
-                stream_wrapper(r, passthrough=passthrough),
-                status_code=r.status,
-                headers=response_headers,
-            )
-        else:
-            try:
-                return await r.json(loads=JSONCodec.loads)
-            except Exception:
-                return None
+                streaming = True
+                return StreamingResponse(
+                    stream_wrapper(r, passthrough=passthrough),
+                    status_code=r.status,
+                    headers=response_headers,
+                )
+            else:
+                try:
+                    return await r.json(loads=JSONCodec.loads)
+                except Exception:
+                    return None
 
     except HTTPException:
         raise
