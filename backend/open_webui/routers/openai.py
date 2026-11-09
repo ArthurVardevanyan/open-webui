@@ -28,6 +28,7 @@ from open_webui.env import (
     BYPASS_MODEL_ACCESS_CONTROL,
     ENABLE_FORWARD_USER_INFO_HEADERS,
     ENABLE_OPENAI_API_PASSTHROUGH,
+    FORWARD_SESSION_INFO_HEADER_CHAT_ID,
     MODELS_CACHE_TTL,
     REDIS_KEY_PREFIX,
 )
@@ -41,7 +42,8 @@ from open_webui.models.users import UserModel
 from open_webui.utils.access_control import check_model_access, has_connection_access, has_permission
 from open_webui.utils.anthropic import ANTHROPIC_VERSION, get_anthropic_models, is_anthropic_url
 from open_webui.utils.auth import get_admin_user, get_verified_user
-from open_webui.utils.headers import get_headers_and_cookies, include_user_info_headers
+from open_webui.utils.headers import get_custom_headers, get_microsoft_entra_id_access_token, include_user_info_headers
+from open_webui.utils.oauth import get_system_oauth_token
 from open_webui.utils.json_codec import JSONCodec
 from open_webui.utils.misc import convert_logit_bias_input_to_json, get_provider_function, merge_tool_call_batches
 from open_webui.utils.model_ids import strip_provider_model_prefix
@@ -172,7 +174,8 @@ async def get_headers_and_cookies(
     metadata: dict | None = None,
     user: UserModel = None,
 ):
-    cookies = {}
+    config = config or {}
+    cookies = getattr(request, 'cookies', {}) if config.get('forward_cookies', False) else {}
     headers = {
         'Content-Type': 'application/json',
         **(
@@ -189,7 +192,7 @@ async def get_headers_and_cookies(
     }
 
     if ENABLE_FORWARD_USER_INFO_HEADERS and user:
-        headers = include_user_info_headers(headers, user)
+        headers = include_user_info_headers(headers, user, request=request)
         if metadata and metadata.get('chat_id'):
             headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = metadata.get('chat_id')
 
@@ -203,25 +206,13 @@ async def get_headers_and_cookies(
 
     if auth_type == 'bearer' or auth_type is None:
         # Default to bearer if not specified
-        token = f'{key}'
+        token = key
     elif auth_type == 'none':
         token = None
     elif auth_type == 'session':
-        cookies = request.cookies
         token = request.state.token.credentials
     elif auth_type == 'system_oauth':
-        cookies = request.cookies
-
-        oauth_token = None
-        try:
-            if request.cookies.get('oauth_session_id', None):
-                oauth_token = await request.app.state.oauth_manager.get_oauth_token(
-                    user.id,
-                    request.cookies.get('oauth_session_id', None),
-                )
-        except Exception as e:
-            log.error(f'Error getting OAuth token: {e}')
-
+        oauth_token = await get_system_oauth_token(request, user) if user else None
         if oauth_token:
             token = f'{oauth_token.get("access_token", "")}'
 
@@ -242,21 +233,6 @@ async def get_headers_and_cookies(
         headers['X-Forwarded-For'] = x_forwarded_for
 
     return headers, cookies
-
-
-def get_microsoft_entra_id_access_token():
-    """
-    Get Microsoft Entra ID access token using DefaultAzureCredential for Azure OpenAI.
-    Returns the token string or None if authentication fails.
-    """
-    try:
-        token_provider = get_bearer_token_provider(
-            DefaultAzureCredential(), 'https://cognitiveservices.azure.com/.default'
-        )
-        return token_provider()
-    except Exception as e:
-        log.error(f'Error getting Microsoft Entra ID access token: {e}')
-        return None
 
 
 ##########################################
